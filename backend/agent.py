@@ -20,34 +20,6 @@ llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY")
 )
 
-# # 1. Define the Schema (This forces the AI to output data that matches React's Redux state)
-# class InteractionFormSchema(BaseModel):
-#     hcpName: str = Field(description="Name of the Healthcare Professional")
-#     interactionType: str = Field(description="Type of interaction, e.g., Meeting, Email, Call")
-#     date: str = Field(description="Date of interaction in DD-MM-YYYY format")
-#     time: str = Field(description="Time of interaction in HH:MM format")
-#     attendees: str = Field(description="Other attendees present")
-#     topicsDiscussed: str = Field(description="Summary of topics discussed")
-#     materialsShared: List[str] = Field(description="List of materials or brochures shared")
-#     samplesDistributed: List[str] = Field(description="List of drug samples distributed")
-#     sentiment: str = Field(description="Observed sentiment: Positive, Neutral, or Negative")
-#     outcomes: str = Field(description="Key outcomes or agreements")
-#     followUpActions: str = Field(description="Next steps or tasks to follow up on")
-
-# # 2. Define the Mandatory Tool 1: Log Interaction
-# @tool
-# def log_interaction(summary: str) -> dict:
-#     """
-#     Use this tool when the user provides an initial summary of a meeting to log a NEW interaction.
-#     It extracts all details into a structured JSON payload.
-#     """
-#     # Force the LLM to output our exact Pydantic schema
-#     structured_llm = llm.with_structured_output(InteractionFormSchema)
-#     prompt = f"Extract the meeting details from the following summary and map them to the schema. If a field is not mentioned, leave it empty. Summary: {summary}"
-    
-#     result = structured_llm.invoke(prompt)
-#     return {"action": "UPDATE_FORM", "data": result.dict()}
-
 # 1. Define the Schema (Updated with strict array instructions and defaults)
 class InteractionFormSchema(BaseModel):
     hcpName: str = Field(default="", description="Name of the Healthcare Professional")
@@ -79,12 +51,13 @@ def log_interaction(summary: str) -> dict:
 
 # 3. Define the Mandatory Tool 2: Edit Interaction
 @tool
-def edit_interaction(field_to_update: str, new_value: str) -> dict:
+def edit_interaction(updates: dict) -> dict:
     """
-    Use this tool to edit or update a specific field in the existing form based on user corrections.
-    Valid fields are: hcpName, interactionType, date, time, attendees, topicsDiscussed, materialsShared, samplesDistributed, sentiment, outcomes, followUpActions.
+    Use this tool to edit or update existing fields in the form.
+    Pass a dictionary where the keys are the field names and values are the new values.
+    Valid keys: hcpName, interactionType, date, time, attendees, topicsDiscussed, materialsShared, samplesDistributed, sentiment, outcomes, followUpActions.
     """
-    return {"action": "PATCH_FORM", "data": {field_to_update: new_value}}
+    return {"action": "PATCH_FORM", "data": updates}
 
 # 4. Custom Tool 1: Fetch HCP Profile
 @tool
@@ -121,13 +94,16 @@ tools = [
     generate_follow_up_tasks
 ]
 
-# 7. Create the LangGraph Agent (Removed the state_modifier argument to prevent version errors)
+# 7. Create the LangGraph Agent
 system_prompt = """You are an AI assistant for a pharma sales rep. 
 Your job is to help log Healthcare Professional (HCP) interactions into the CRM.
 - If the user provides a summary of a meeting, use the 'log_interaction' tool to extract the data.
 - If they want to change a specific field, use the 'edit_interaction' tool.
 - Use other tools if they ask for information or follow-ups.
-Always be concise and helpful in your text responses."""
+
+STRICT RULES:
+1. ALWAYS use the provided tools to update the form. Do NOT just output JSON.
+2. In your final text response to the user, speak like a normal, helpful human assistant. NEVER show raw JSON in your text responses."""
 
 # Just pass the LLM and tools
 agent_executor = create_react_agent(llm, tools)
