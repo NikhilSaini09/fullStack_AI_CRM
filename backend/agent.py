@@ -25,9 +25,10 @@ llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY")
 )
 
-# 1. Define the Schema (Updated with strict array instructions and defaults)
+# 1. Define the Schema (Added hcpSpecialty for invisible memory)
 class InteractionFormSchema(BaseModel):
     hcpName: str = Field(default="", description="Name of the Healthcare Professional")
+    hcpSpecialty: str = Field(default="Unknown", description="Specialty of the HCP if mentioned (e.g., cardiologist)")
     interactionType: str = Field(default="Meeting", description="Type of interaction, e.g., Meeting, Email, Call")
     date: str = Field(default="", description="Date of interaction in DD-MM-YYYY format")
     time: str = Field(default="", description="Time of interaction in HH:MM format")
@@ -114,24 +115,30 @@ def get_interaction_history(hcp_name: str) -> str:
 
 # NEW TOOL: Save the Interaction to the Database
 @tool
-def save_interaction_to_db(hcp_name: str, date: str, topics: str, materials: str) -> str:
+def save_interaction_to_db(hcp_name: str, date: str, topics: str, materials: str = "", inferred_specialty: str = "Unknown") -> str:
     """
-    Use this tool ONLY when the user explicitly asks to 'Save', 'Submit', or 'Finalize' the log.
-    Saves the current interaction data permanently to the database.
+    Saves the interaction data.
+    IMPORTANT: Read the 'Current Form State' to find 'hcpSpecialty' and pass it exactly as 'inferred_specialty'.
     """
     conn = sqlite3.connect('crm_data.db')
     cursor = conn.cursor()
-    # Save the interaction
+    
     cursor.execute("INSERT INTO interactions (hcp_name, date, topics, materials) VALUES (?, ?, ?, ?)", 
                     (hcp_name, date, topics, materials))
     
-    # Also create a basic profile for them if they are brand new!
-    cursor.execute("INSERT OR IGNORE INTO hcp_profiles (name, specialty, preferences) VALUES (?, 'Unknown', 'Newly added via interaction log.')", (hcp_name,))
+    cursor.execute("SELECT * FROM hcp_profiles WHERE name = ?", (hcp_name,))
+    existing_profile = cursor.fetchone()
     
+    if not existing_profile:
+        cursor.execute("INSERT INTO hcp_profiles (name, specialty, preferences) VALUES (?, ?, 'Added via interaction log.')", 
+                        (hcp_name, inferred_specialty))
+    elif inferred_specialty != "Unknown":
+        cursor.execute("UPDATE hcp_profiles SET specialty = ? WHERE name = ?", 
+                        (inferred_specialty, hcp_name))
+        
     conn.commit()
     conn.close()
     
-    # --- CHANGED THIS LINE: Return a valid JSON string to tell React to clear the form! ---
     return json.dumps({"action": "RESET_FORM", "data": {}})
 
 # 6. Custom Tool 3: Generate Follow-up Tasks
@@ -153,70 +160,19 @@ tools = [
     get_interaction_history
 ]
 
-# # 7. Create the LangGraph Agent
-# system_prompt = """You are a helpful AI assistant for a pharma sales rep. 
-# Your job is to manage the CRM interface using the tools provided to you.
+# 7. Create the LangGraph Agent
+system_prompt = """You are a CRM AI assistant. 
+You cannot affect the system just by talking. You MUST execute your tools to perform actions.
 
-# CRITICAL RULES:
-# 1. You MUST ALWAYS use the 'log_interaction' or 'edit_interaction' tools to save data. NEVER just pretend you did it by replying with text.
-# 2. NEVER explain what tools you are using in your text response.
-# 3. NEVER output JSON, <function> tags, or code blocks in your conversational response.
-# 4. Call the tool natively, and then simply reply to the user with a brief confirmation."""
-
-# # 7. Create the LangGraph Agent
-# system_prompt = """You are a helpful AI assistant for a pharma sales rep. 
-# Your job is to manage the CRM interface and look up database records using your tools.
-
-# HOW TO ROUTE INTENTS:
-# - If the user provides a summary of a new meeting to log -> Use 'log_interaction'.
-# - If the user wants to fix a mistake on the form -> Use 'edit_interaction'.
-# - If the user says "save" or "submit" the form -> Use 'save_interaction_to_db'.
-# - If the user asks about a past doctor (e.g., "Tell me about Dr. House" or "What is his specialty?") -> Use 'fetch_hcp_profile'. Use the data from the database to answer them naturally in text.
-# - If the user asks about past materials -> Use 'search_materials'.
-
-# CRITICAL RULES:
-# 1. NEVER explain what tools you are using in your text response.
-# 2. NEVER output JSON, <function> tags, or code blocks in your conversational response.
-# 3. If logging/editing, call the tool and reply with a brief confirmation. 
-# 4. If fetching data, call the tool and summarize the findings for the user!"""
-
-# # 7. Create the LangGraph Agent (Anti-Hallucination Version)
-# system_prompt = """You are a strict, factual AI assistant for a CRM database.
-# Your ONLY source of truth is the tools provided to you. NEVER invent, guess, or hallucinate information. Do not use outside knowledge.
-
-# HOW TO ROUTE INTENTS:
-# - New meeting summary -> Use 'log_interaction'.
-# - Fixing a form mistake -> Use 'edit_interaction'.
-# - Looking up a doctor -> Use 'fetch_hcp_profile'. You MUST reply to the user using ONLY the exact string returned by the database.
-# - Finding past materials -> Use 'search_materials'.
-
-# PROTECTING THE SAVE TOOL:
-# - You are strictly FORBIDDEN from using the 'save_interaction_to_db' tool unless the user explicitly types the words "save", "submit", or "finalize". Never assume a generic "yes" means save.
-
-# CRITICAL RULES:
-# 1. NEVER explain what tools you are using.
-# 2. NEVER output JSON, <function> tags, or code blocks in your conversational response.
-# 3. If a database tool says "Unknown", "No profile found", or "No past materials", you MUST tell the user exactly that. Do not invent a medical history.
-# """
-
-# 7. Create the LangGraph Agent (Anti-Hallucination Version)
-system_prompt = """You are a strict, factual AI assistant for a CRM database.
-Your ONLY source of truth is the tools provided to you. NEVER invent, guess, or hallucinate information. Do not use outside knowledge.
-
-HOW TO ROUTE INTENTS:
-- New meeting summary -> Use 'log_interaction'.
-- Fixing a form mistake -> Use 'edit_interaction'.
-- Looking up a doctor's static profile/specialty -> Use 'fetch_hcp_profile'.
-- Looking up past meeting dates, topics, or history with a doctor -> Use 'get_interaction_history'.
-- Finding past materials -> Use 'search_materials'.
-
-PROTECTING THE SAVE TOOL:
-- You are strictly FORBIDDEN from using the 'save_interaction_to_db' tool unless the user explicitly types the words "save", "submit", or "finalize". Never assume a generic "yes" means save.
+WORKFLOW RULES:
+1. Drafting: If the user provides meeting details -> EXECUTE 'log_interaction' or 'edit_interaction'.
+2. Saving: If the user explicitly says "save" -> EXECUTE 'save_interaction_to_db'. 
+3. Querying: If looking up info -> EXECUTE 'fetch_hcp_profile' or 'get_interaction_history'.
 
 CRITICAL RULES:
-1. NEVER explain what tools you are using.
-2. NEVER output JSON, <function> tags, or code blocks in your conversational response.
-3. If a database tool says "Unknown" or "No past meetings", you MUST tell the user exactly that. Do not invent a medical history.
+1. Do NOT roleplay. You must actually trigger the tool.
+2. After saving or logging, give a short, friendly confirmation.
+3. AFTER FETCHING DATA (like a profile or history), YOU MUST WRITE THE ACTUAL FETCHED DATA IN YOUR TEXT REPLY SO THE USER CAN READ IT! Do not hide the data.
 """
 
 # Just pass the LLM and tools
@@ -243,19 +199,19 @@ def run_agent(user_message: str, current_state: dict):
     # Scan the graph's internal messages to see if a tool was fired
     for msg in response["messages"]:
         if msg.type == "tool":
+            print(f"--- TOOL FIRED! Raw Output: {msg.content} ---") # <--- Added this line!
             try:
-                tool_data = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
-                if isinstance(tool_data, dict) and "action" in tool_data:
-                    action_type = tool_data["action"]
-                    extracted_data = tool_data["data"]
-            except Exception as e:
-                print("Error parsing tool data:", e)
+                # Smarter parsing: Only try to load JSON if the string contains our action key
+                if isinstance(msg.content, str) and '"action":' in msg.content:
+                    tool_data = json.loads(msg.content)
+                    action_type = tool_data.get("action", "NONE")
+                    extracted_data = tool_data.get("data", {})
+            except Exception:
+                pass
                 
-    # --- WE ADDED THIS DEBUG PRINT ---
     print(f"\n--- BACKEND DEBUG ---")
     print(f"AI Text Reply: {ai_text}")
     print(f"Action Triggered: {action_type}")
-    print(f"Data Sent to React: {extracted_data}")
     print(f"---------------------\n")
                 
     return {

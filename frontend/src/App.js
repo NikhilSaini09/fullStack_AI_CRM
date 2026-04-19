@@ -138,8 +138,8 @@ function App() {
           <button className="prompt-btn" onClick={() => setChatInput("Change the sentiment to Neutral.")}>
             + Edit Interaction: "Change the sentiment to Neutral."
           </button>
-          <button className="prompt-btn" onClick={() => setChatInput("What background info do we have on Dr. House?")}>
-            + Fetch Profile: "What background info do we have on Dr. House?"
+          <button className="prompt-btn" onClick={() => setChatInput("What background info do we have on Dr. Strange?")}>
+            + Fetch Profile: "What background info do we have on Dr. Strange?"
           </button>
           <button className="prompt-btn" onClick={() => setChatInput("When did I last meet with Dr. Smith and what did we discuss?")}>
             + Fetch History: "When did I last meet with Dr. Smith..."
