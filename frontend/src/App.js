@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useSelector, useDispatch } from 'react-redux';
-import { updateForm } from './redux/interactionSlice';
+import { updateForm, resetForm } from './redux/interactionSlice';
 import './App.css';
 
 function App() {
@@ -49,9 +49,12 @@ function App() {
       // Add the AI's reply to the chat window
       setMessages(prev => [...prev, { role: 'ai', text: data.ai_response }]);
       
-      // If the AI sent back form data, we will dispatch it to Redux here later!
+      // MAGIC HAPPENS HERE: If the AI decided to use a tool, update the form!
       if (data.action === "UPDATE_FORM" || data.action === "PATCH_FORM") {
         dispatch(updateForm(data.extracted_data));
+      } else if (data.action === "RESET_FORM") {
+        // If the AI saved the data to the DB, clear the screen!
+        dispatch(resetForm()); 
       }
 
     } catch (error) {
@@ -92,6 +95,18 @@ function App() {
         <div className="form-group">
           <label>Topics Discussed</label>
           <textarea rows="4" value={formState.topicsDiscussed} readOnly disabled />
+        </div>
+
+        <div style={{ display: 'flex', gap: '20px' }}>
+          <div className="form-group" style={{ flex: 1 }}>
+            <label>Materials Shared</label>
+            {/* We use .join() because materialsShared is an array! */}
+            <input type="text" value={formState.materialsShared.join(', ')} readOnly disabled />
+          </div>
+          <div className="form-group" style={{ flex: 1 }}>
+            <label>Samples Distributed</label>
+            <input type="text" value={formState.samplesDistributed.join(', ')} readOnly disabled />
+          </div>
         </div>
 
         <div className="form-group">

@@ -1,5 +1,7 @@
 # backend/agent.py
 import os
+import json
+import sqlite3
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from typing import List
@@ -7,7 +9,10 @@ from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import HumanMessage, SystemMessage
-import json
+from database import init_db
+
+# Run the database initialization explicitly
+init_db()
 
 # Load the API key from the .env file
 load_dotenv()
@@ -36,7 +41,7 @@ class InteractionFormSchema(BaseModel):
 
 # 2. Define the Mandatory Tool 1: Log Interaction
 @tool
-def log_interaction(summary: str) -> dict:
+def log_interaction(summary: str) -> str: # <--- Changed return type to str
     """
     Use this tool when the user provides an initial summary of a meeting to log a NEW interaction.
     It extracts all details into a structured JSON payload.
@@ -47,35 +52,87 @@ def log_interaction(summary: str) -> dict:
     prompt = f"Extract the meeting details from the following summary. IMPORTANT: For materialsShared and samplesDistributed, you MUST return a valid JSON array of strings, even if there is only one item. If none, return []. Summary: {summary}"
     
     result = structured_llm.invoke(prompt)
-    return {"action": "UPDATE_FORM", "data": result.dict()}
+    
+    # <--- We now explicitly convert the dictionary to a valid JSON string using json.dumps!
+    return json.dumps({"action": "UPDATE_FORM", "data": result.dict()})
 
 # 3. Define the Mandatory Tool 2: Edit Interaction
 @tool
-def edit_interaction(updates: dict) -> dict:
+def edit_interaction(updates: dict) -> str: # <--- Changed return type to str
     """
     Use this tool to edit or update existing fields in the form.
     Pass a dictionary where the keys are the field names and values are the new values.
     Valid keys: hcpName, interactionType, date, time, attendees, topicsDiscussed, materialsShared, samplesDistributed, sentiment, outcomes, followUpActions.
     """
-    return {"action": "PATCH_FORM", "data": updates}
+    # <--- We now explicitly convert the dictionary to a valid JSON string using json.dumps!
+    return json.dumps({"action": "PATCH_FORM", "data": updates})
 
-# 4. Custom Tool 1: Fetch HCP Profile
+# 4. Custom Tool 1: Fetch HCP Profile (Now reads from Real DB)
 @tool
 def fetch_hcp_profile(hcp_name: str) -> str:
     """Fetches background information and past preferences for a given HCP."""
-    db = {
-        "Dr. Smith": "Cardiologist. Prefers morning meetings. High prescriber of BetaBlock-X.",
-        "Dr. Sharma": "Oncologist. Key opinion leader. Interested in Phase III trial data."
-    }
-    return db.get(hcp_name, "No profile found in database.")
+    conn = sqlite3.connect('crm_data.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT specialty, preferences FROM hcp_profiles WHERE name LIKE ?", (f"%{hcp_name}%",))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        return f"Specialty: {result[0]}, Preferences: {result[1]}"
+    return "No profile found in database. They might be a new contact."
 
-# 5. Custom Tool 2: Search Materials
+# 5. Custom Tool 2: Search Materials (Now searches past interactions)
 @tool
-def search_materials(topic: str) -> List[str]:
-    """Searches the database for available materials or brochures related to a topic."""
-    if "cancer" in topic.lower() or "onco" in topic.lower():
-        return ["OncoBoost Phase III PDF", "Oncology Care Guide"]
-    return ["General Product Brochure"]
+def search_materials(topic: str) -> str:
+    """Searches the database to see what materials were shared in the past about a specific topic."""
+    conn = sqlite3.connect('crm_data.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT hcp_name, materials FROM interactions WHERE topics LIKE ?", (f"%{topic}%",))
+    results = cursor.fetchall()
+    conn.close()
+    
+    if results:
+        history = [f"Shared {r[1]} with {r[0]}" for r in results]
+        return "Past material history: " + " | ".join(history)
+    return "No past materials found for this topic."
+
+# NEW TOOL: Fetch Meeting History
+@tool
+def get_interaction_history(hcp_name: str) -> str:
+    """Fetches the history of past meetings, dates, and topics for a specific HCP."""
+    conn = sqlite3.connect('crm_data.db')
+    cursor = conn.cursor()
+    # We pull the date, topics, and materials from the interactions table
+    cursor.execute("SELECT date, topics, materials FROM interactions WHERE hcp_name LIKE ?", (f"%{hcp_name}%",))
+    results = cursor.fetchall()
+    conn.close()
+    
+    if results:
+        history = [f"Date: {r[0]} | Topics: {r[1]} | Materials: {r[2]}" for r in results]
+        return "Past Meetings:\n" + "\n".join(history)
+    return "No past meetings found for this doctor."
+
+# NEW TOOL: Save the Interaction to the Database
+@tool
+def save_interaction_to_db(hcp_name: str, date: str, topics: str, materials: str) -> str:
+    """
+    Use this tool ONLY when the user explicitly asks to 'Save', 'Submit', or 'Finalize' the log.
+    Saves the current interaction data permanently to the database.
+    """
+    conn = sqlite3.connect('crm_data.db')
+    cursor = conn.cursor()
+    # Save the interaction
+    cursor.execute("INSERT INTO interactions (hcp_name, date, topics, materials) VALUES (?, ?, ?, ?)", 
+                    (hcp_name, date, topics, materials))
+    
+    # Also create a basic profile for them if they are brand new!
+    cursor.execute("INSERT OR IGNORE INTO hcp_profiles (name, specialty, preferences) VALUES (?, 'Unknown', 'Newly added via interaction log.')", (hcp_name,))
+    
+    conn.commit()
+    conn.close()
+    
+    # --- CHANGED THIS LINE: Return a valid JSON string to tell React to clear the form! ---
+    return json.dumps({"action": "RESET_FORM", "data": {}})
 
 # 6. Custom Tool 3: Generate Follow-up Tasks
 @tool
@@ -91,19 +148,76 @@ tools = [
     edit_interaction, 
     fetch_hcp_profile, 
     search_materials, 
-    generate_follow_up_tasks
+    generate_follow_up_tasks,
+    save_interaction_to_db,
+    get_interaction_history
 ]
 
-# 7. Create the LangGraph Agent
-system_prompt = """You are an AI assistant for a pharma sales rep. 
-Your job is to help log Healthcare Professional (HCP) interactions into the CRM.
-- If the user provides a summary of a meeting, use the 'log_interaction' tool to extract the data.
-- If they want to change a specific field, use the 'edit_interaction' tool.
-- Use other tools if they ask for information or follow-ups.
+# # 7. Create the LangGraph Agent
+# system_prompt = """You are a helpful AI assistant for a pharma sales rep. 
+# Your job is to manage the CRM interface using the tools provided to you.
 
-STRICT RULES:
-1. ALWAYS use the provided tools to update the form. Do NOT just output JSON.
-2. In your final text response to the user, speak like a normal, helpful human assistant. NEVER show raw JSON in your text responses."""
+# CRITICAL RULES:
+# 1. You MUST ALWAYS use the 'log_interaction' or 'edit_interaction' tools to save data. NEVER just pretend you did it by replying with text.
+# 2. NEVER explain what tools you are using in your text response.
+# 3. NEVER output JSON, <function> tags, or code blocks in your conversational response.
+# 4. Call the tool natively, and then simply reply to the user with a brief confirmation."""
+
+# # 7. Create the LangGraph Agent
+# system_prompt = """You are a helpful AI assistant for a pharma sales rep. 
+# Your job is to manage the CRM interface and look up database records using your tools.
+
+# HOW TO ROUTE INTENTS:
+# - If the user provides a summary of a new meeting to log -> Use 'log_interaction'.
+# - If the user wants to fix a mistake on the form -> Use 'edit_interaction'.
+# - If the user says "save" or "submit" the form -> Use 'save_interaction_to_db'.
+# - If the user asks about a past doctor (e.g., "Tell me about Dr. House" or "What is his specialty?") -> Use 'fetch_hcp_profile'. Use the data from the database to answer them naturally in text.
+# - If the user asks about past materials -> Use 'search_materials'.
+
+# CRITICAL RULES:
+# 1. NEVER explain what tools you are using in your text response.
+# 2. NEVER output JSON, <function> tags, or code blocks in your conversational response.
+# 3. If logging/editing, call the tool and reply with a brief confirmation. 
+# 4. If fetching data, call the tool and summarize the findings for the user!"""
+
+# # 7. Create the LangGraph Agent (Anti-Hallucination Version)
+# system_prompt = """You are a strict, factual AI assistant for a CRM database.
+# Your ONLY source of truth is the tools provided to you. NEVER invent, guess, or hallucinate information. Do not use outside knowledge.
+
+# HOW TO ROUTE INTENTS:
+# - New meeting summary -> Use 'log_interaction'.
+# - Fixing a form mistake -> Use 'edit_interaction'.
+# - Looking up a doctor -> Use 'fetch_hcp_profile'. You MUST reply to the user using ONLY the exact string returned by the database.
+# - Finding past materials -> Use 'search_materials'.
+
+# PROTECTING THE SAVE TOOL:
+# - You are strictly FORBIDDEN from using the 'save_interaction_to_db' tool unless the user explicitly types the words "save", "submit", or "finalize". Never assume a generic "yes" means save.
+
+# CRITICAL RULES:
+# 1. NEVER explain what tools you are using.
+# 2. NEVER output JSON, <function> tags, or code blocks in your conversational response.
+# 3. If a database tool says "Unknown", "No profile found", or "No past materials", you MUST tell the user exactly that. Do not invent a medical history.
+# """
+
+# 7. Create the LangGraph Agent (Anti-Hallucination Version)
+system_prompt = """You are a strict, factual AI assistant for a CRM database.
+Your ONLY source of truth is the tools provided to you. NEVER invent, guess, or hallucinate information. Do not use outside knowledge.
+
+HOW TO ROUTE INTENTS:
+- New meeting summary -> Use 'log_interaction'.
+- Fixing a form mistake -> Use 'edit_interaction'.
+- Looking up a doctor's static profile/specialty -> Use 'fetch_hcp_profile'.
+- Looking up past meeting dates, topics, or history with a doctor -> Use 'get_interaction_history'.
+- Finding past materials -> Use 'search_materials'.
+
+PROTECTING THE SAVE TOOL:
+- You are strictly FORBIDDEN from using the 'save_interaction_to_db' tool unless the user explicitly types the words "save", "submit", or "finalize". Never assume a generic "yes" means save.
+
+CRITICAL RULES:
+1. NEVER explain what tools you are using.
+2. NEVER output JSON, <function> tags, or code blocks in your conversational response.
+3. If a database tool says "Unknown" or "No past meetings", you MUST tell the user exactly that. Do not invent a medical history.
+"""
 
 # Just pass the LLM and tools
 agent_executor = create_react_agent(llm, tools)
@@ -112,7 +226,6 @@ agent_executor = create_react_agent(llm, tools)
 def run_agent(user_message: str, current_state: dict):
     context_message = f"User Message: {user_message}\nCurrent Form State: {json.dumps(current_state)}"
     
-    # We now pass the SystemMessage directly into the graph's memory at runtime!
     inputs = {
         "messages": [
             SystemMessage(content=system_prompt),
@@ -138,55 +251,15 @@ def run_agent(user_message: str, current_state: dict):
             except Exception as e:
                 print("Error parsing tool data:", e)
                 
+    # --- WE ADDED THIS DEBUG PRINT ---
+    print(f"\n--- BACKEND DEBUG ---")
+    print(f"AI Text Reply: {ai_text}")
+    print(f"Action Triggered: {action_type}")
+    print(f"Data Sent to React: {extracted_data}")
+    print(f"---------------------\n")
+                
     return {
         "ai_response": ai_text,
         "action": action_type,
         "extracted_data": extracted_data
     }
-
-
-
-
-
-# # 7. Create the LangGraph Agent
-# system_prompt = """You are an AI assistant for a pharma sales rep. 
-# Your job is to help log Healthcare Professional (HCP) interactions into the CRM.
-# - If the user provides a summary of a meeting, use the 'log_interaction' tool to extract the data.
-# - If they want to change a specific field, use the 'edit_interaction' tool.
-# - Use other tools if they ask for information or follow-ups.
-# Always be concise and helpful in your text responses."""
-
-# # This binds the Groq LLM, our 5 tools, and the system prompt together into a graph
-# agent_executor = create_react_agent(llm, tools, state_modifier=system_prompt)
-
-# # 8. Define the function that FastAPI will call
-# # 8. Define the function that FastAPI will call
-# def run_agent(user_message: str, current_state: dict):
-#     # INJECT THE CURRENT STATE: Now the AI knows what is currently in the form!
-#     context_message = f"User Message: {user_message}\nCurrent Form State: {json.dumps(current_state)}"
-    
-#     inputs = {"messages": [HumanMessage(content=context_message)]}
-#     response = agent_executor.invoke(inputs)
-    
-#     # Extract the AI's conversational text reply
-#     ai_text = response["messages"][-1].content
-    
-#     extracted_data = {}
-#     action_type = "NONE"
-    
-#     # Scan the graph's internal messages to see if a tool was fired
-#     for msg in response["messages"]:
-#         if msg.type == "tool":
-#             try:
-#                 tool_data = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
-#                 if isinstance(tool_data, dict) and "action" in tool_data:
-#                     action_type = tool_data["action"]
-#                     extracted_data = tool_data["data"]
-#             except Exception as e:
-#                 print("Error parsing tool data:", e)
-                
-#     return {
-#         "ai_response": ai_text,
-#         "action": action_type,
-#         "extracted_data": extracted_data
-#     }
